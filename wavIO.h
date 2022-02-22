@@ -66,6 +66,7 @@ class WavReader
 	unsigned int riffLength;
 	unsigned int dataLength;
 	bool ignoreHeaderSize;
+	bool bigEndian;
 	__int64 samplesLen;
 
 public:

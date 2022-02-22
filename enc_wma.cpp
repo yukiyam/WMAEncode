@@ -245,6 +245,7 @@ void printUsage(const _TCHAR* exeName)
 	
 	wcout << exeName << L" ver." << Version << L": command-line interface to MS WMA encoder";
 	wcout << L" (uses Windows Media Format runtime)\n";
+	wcout << L" [with AU/AIFF support]\n";
 
 	wcout << L"\nUsage:\n";
 	wcout << L"\t" << exeName2 << " <input> [output] [options]\n";

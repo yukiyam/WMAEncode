@@ -59,6 +59,17 @@ static XGUID ieee_float_guid =
 #define WRITE_U32(buf, x) (*(DWORD*)(buf) = (DWORD)(x))
 #define WRITE_U16(buf, x) (*(WORD*)(buf) = (WORD)(x))
 
+template<typename T> static inline DWORD BEU32(T *buf)
+{
+	unsigned char *p = (unsigned char *)buf;
+	return p[0] * 16777216 + p[1] * 65536 + p[2] * 256 + p[3];
+}
+
+template<typename T> static inline WORD BEU16(T *buf)
+{
+	unsigned char *p = (unsigned char *)buf;
+	return p[0] * 256 + p[1];
+}
 
 static bool seek_forward(FILE *in, size_t length)
 {
@@ -87,6 +98,18 @@ static bool read_wave_chunk(FILE *in, unsigned char type[4], unsigned int *len)
 	return true;
 }
 
+static bool read_aiff_chunk(FILE *in, unsigned char type[4], unsigned int *len)
+{
+	unsigned char buf[8];
+
+	if (fread(buf, 1, 8, in) < 8)
+		return false;
+
+	memcpy(type, buf, 4);
+	*len = BEU32(buf+4);
+	return true;
+}
+
 bool is_wave(const unsigned char *buf, unsigned int* len)
 {
 	if (memcmp(buf, "RIFF", 4) != 0)
@@ -100,6 +123,44 @@ bool is_wave(const unsigned char *buf, unsigned int* len)
 	return true;
 }
 
+bool is_snd(const unsigned char *buf, unsigned int* len)
+{
+	if (memcmp(buf, ".snd", 4) != 0)
+		return false;
+	*len = BEU32(buf+8);
+	return true;
+}
+
+bool is_aiff(const unsigned char *buf, unsigned int *len)
+{
+	if (memcmp(buf, "FORM", 4) != 0)
+		return false;
+
+	*len = BEU32(buf+4);
+
+	if (memcmp(buf+8, "AIFF", 4) != 0)
+		return false;
+
+	return true;
+}
+
+static int BEExtended80ToInt(const unsigned char *ext80)
+{
+	int sign;
+	int exp;
+	unsigned __int64 mantissa;
+	double value;
+	
+	exp = BEU16(ext80);
+	sign = (exp & 0x8000) >> 15;
+	exp &= 32767;
+	mantissa = ((unsigned __int64)BEU32(ext80+2) << 32) + BEU32(ext80+6);
+	value = ldexp(mantissa, exp - 16383 - 63);	// a bit inaccurate
+	if (sign)
+		value = - value;
+	//return round(value);
+	return floor(value + 0.5);
+}
 
 void WavReader::init()
 {
@@ -109,6 +170,7 @@ void WavReader::init()
 	sampleSize_ = 0;
 	riffLength = dataLength = 0;
 	ignoreHeaderSize = false;
+	bigEndian = false;
 	samplesLen = 0;
 	dataOffset = 0;
 }
@@ -137,6 +199,98 @@ void WavReader::open(const _TCHAR* name, bool ignorelength)
 
 	ret = fread(buf, 1, 12, in);
 	if (ret < 12) throw myexc(_T("Input file is truncated"), ERROR_CANNOT_OPEN_INFILE);
+
+	if (is_snd(buf, &dataLen)) {
+		bigEndian = true;
+		
+		ret = fread(buf+12, 1, 12, in);
+		
+		format.formatTag = WAVE_FORMAT_PCM;
+		format.nChannels = BEU32(buf+20);
+		format.sampleRate = BEU32(buf+16);
+		int encoding = BEU32(buf+12);
+		int bits;
+		switch (encoding) {
+		case 2:
+			bits = 8;
+			break;
+		case 3:
+			bits = 16;
+			break;
+		case 4:
+			bits = 24;
+			break;
+		case 5:
+			bits = 32;
+			break;
+		default:
+			throw myexc(_T(".snd file has unsupported encoding"), ERROR_CANNOT_OPEN_INFILE);
+		}
+		format.blockAlign = format.nChannels * bits / 8;
+		format.avgBytesPerSec = format.sampleRate * format.blockAlign;
+		format.bitsPerSample = bits;
+		format.validBitsPerSample = bits;
+		format.channelMask = guessChannelMask(format.nChannels);
+		sampleSize_ = format.nChannels * ((format.bitsPerSample + 7) / 8);
+		
+		dataOffset = 24;
+		riffLength = dataLen + 24;
+		dataLength = dataLen;
+		if (dataLength == 0xFFFFFFFF || ignorelength == true)
+			{ ignoreHeaderSize = true;  samplesLen = 0; }
+		else
+			{ ignoreHeaderSize = false; samplesLen = dataLength/sampleSize(); }
+		return;
+	}
+
+	if (is_aiff(buf, &riffLen)) {
+		bigEndian = true;
+		
+		for (;;) {
+			if (!read_aiff_chunk(in, fcc, &chunkLen)) throw myexc(_T("Unexpected EOF"), ERROR_CANNOT_OPEN_INFILE);
+			if (memcmp(fcc, "COMM", 4) == 0) {
+				if (chunkLen != 18)
+					throw myexc(_T("Unrecognised common chunk in AIFF"), ERROR_CANNOT_OPEN_INFILE);
+				if (fread(buf, 1, chunkLen, in) < chunkLen)
+					throw myexc(_T("Unexpected EOF in reading AIFF chunk"), ERROR_CANNOT_OPEN_INFILE);
+				//if (chunkLen % 2)
+				//	fgetc(in);
+				
+				format.formatTag = WAVE_FORMAT_PCM;
+				format.nChannels = BEU16(buf+0);
+				format.sampleRate = BEExtended80ToInt(buf+8);
+				format.validBitsPerSample = BEU16(buf+6);
+				format.bitsPerSample = (format.validBitsPerSample+7)/8 * 8;
+				format.blockAlign = format.nChannels * format.bitsPerSample / 8;
+				format.avgBytesPerSec = format.sampleRate * format.blockAlign;
+				format.channelMask = guessChannelMask(format.nChannels);
+				samplesLen = BEU32(buf+2);
+				sampleSize_ = format.blockAlign;
+				dataLen = format.blockAlign * samplesLen;
+			}
+			else if (memcmp(fcc, "SSND", 4) == 0) {
+				if (fread(buf, 1, 8, in) < 8)
+					throw myexc(_T("Unexpected EOF in reading AIFF chunk"), ERROR_CANNOT_OPEN_INFILE);
+				if (BEU32(buf+0) != 0)
+					throw myexc(_T("AIFF file has unsupported SSND offset"), ERROR_CANNOT_OPEN_INFILE);
+				dataOffset = ftell(in);
+				//dataLen = chunkLen; /* length of "data" chunk */
+				/* if (dataLen >= 0x7fffffff or 0xffffffff or 0xffffff00 or 0xfffff000 or 0x0) ... */
+
+				riffLength = riffLen;
+				dataLength = dataLen;
+				if (dataLength == 0xFFFFFFFF || ignorelength == true)
+					{ ignoreHeaderSize = true;  samplesLen = 0; }
+				else
+					{ ignoreHeaderSize = false; }
+				return;
+			}
+			else {
+				if (chunkLen % 2) chunkLen++; /* padding byte */
+				if (!seek_forward(in, chunkLen)) throw myexc(_T("Unexpected EOF in reading AIFF file"), ERROR_CANNOT_OPEN_INFILE);
+			}
+		}
+	}
 
 	if (!is_wave(buf, &riffLen)) throw myexc(_T("Not a valid WAV file"), ERROR_CANNOT_OPEN_INFILE);
 
@@ -267,6 +421,33 @@ size_t WavReader::readSamples(void* arr, size_t nsamples)
 	//if (n==0 && feof(in)) { }
 	//if (n==0 && ferror(in)) { }
 	samplesRead += n;
+	if (bigEndian) {
+		size_t i;
+		unsigned char *p = (unsigned char *)arr;
+		switch (format.bitsPerSample) {
+		case 8:
+			break;
+		case 16:
+			for (i = 0; i < nsamples * format.nChannels; i++) {
+				WRITE_U16(p+2*i, BEU16(p+2*i));
+			}
+			break;
+		case 24:
+			for (i = 0; i < nsamples * format.nChannels; i++) {
+				unsigned char t = p[3*i];
+				p[3*i] = p[3*i+2];
+				p[3*i+2] = t;
+			}
+			break;
+		case 32:
+			for (i = 0; i < nsamples * format.nChannels; i++) {
+				WRITE_U32(p+4*i, BEU32(p+4*i));
+			}
+			break;
+		default:
+			throw myexc(_T("Unsupported bit depth"), ERROR_CANNOT_OPEN_INFILE);
+		}
+	}
 
 	return n;
 }
